@@ -103,8 +103,13 @@ When all requested implementation, archive, and validation steps are complete:
 1. Summarize the changed files and validation results.
 2. Ask whether to push to remote GitHub.
 3. If the user says yes, inspect git status, branch, and remotes first.
-4. Commit and push only the relevant changes the user confirms.
-5. If the user declines or does not clearly approve, do not push.
+4. Commit only the relevant changes the user confirms.
+5. Add this trailer to every commit message:
+   ```text
+   Co-authored-by: Codex <noreply@openai.com>
+   ```
+6. Push only after the commit includes the Codex co-author trailer.
+7. If the user declines or does not clearly approve, do not push.
 
 ## Iteration
 
