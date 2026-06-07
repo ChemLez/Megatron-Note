@@ -29,8 +29,8 @@ Archive a file or folder into a notes library, update the archive README, and cr
    - Do not include a chapter prefix in the title you pass to the script; pass only the title core, such as `Megatron训练入口与初始化主链`.
    - Let the script add the next `第N章：` prefix by reading the target topic's existing README entries.
 7. Run `scripts/archive_note.py` to perform deterministic filesystem and README updates. The model is responsible for classification, title core, summary, and archive reason; the script performs creation, moving, conflict-safe naming, chapter-title sequencing, and README maintenance.
-8. Generate a visual summary by default unless the user explicitly says not to generate one. Use the `imagegen` skill / built-in image generation path for a project-bound PNG/JPG, then save it in the same archive directory as the note and add its path to README.
-9. Report the archived path, README path, final chapter title, visual summary path if generated, and verification results. After all implementation or archive work is complete, ask whether the user wants to push the resulting changes to remote GitHub; do not push without explicit confirmation.
+8. Generate a visual summary by default unless the user explicitly says not to generate one. Use the `imagegen` skill / built-in image generation path for a project-bound PNG/JPG, then save it in the same archive directory as the note, add its path to README, and append the image link to the end of the archived article.
+9. Report the archived path, README path, final chapter title, visual summary path, article path that received the visual link if any, and verification results. After all implementation or archive work is complete, ask whether the user wants to push the resulting changes to remote GitHub; do not push without explicit confirmation.
 
 ## README Format
 
@@ -73,6 +73,12 @@ Avoid: decorative-only imagery, fictional details, unreadable dense text, waterm
 
 After generating the image, save it in the selected archive directory. Use `summary-visual.png` or a conflict-safe variant such as `summary-visual-v2.png`.
 
+When a visual summary exists, link it at the end of the archived article:
+- For a Markdown file, append a `## 总结图` section with `![总结图](relative/path/to/image)`.
+- For an archived folder, append to the first available main Markdown file in this order: `README.md`, `readme.md`, `index.md`, then the first Markdown file found.
+- If no Markdown article exists, keep the README visual link only and report that the article link was skipped.
+- The script uses an `archive-notes-summary-visual` marker so a later run can replace the previous visual-link block instead of appending duplicates.
+
 ## Script Usage
 
 Use the bundled script after classification decisions are made:
@@ -88,7 +94,7 @@ python /Users/liz/.codex/skills/archive-notes/scripts/archive_note.py \
   --visual-path <optional-generated-image-path>
 ```
 
-The script adds the next `第N章：` prefix by default and prints JSON containing the final chapter title, archived path, topic directory, README path, and relative links. Use `--dry-run` to preview without moving files or writing README. Use `--no-chapter-title` only when the user explicitly asks not to use chapter sequencing.
+The script adds the next `第N章：` prefix by default and prints JSON containing the final chapter title, archived path, topic directory, README path, README relative links, and `article_visual_path` when it appended the visual link to a Markdown article. Use `--dry-run` to preview without moving files or writing README. Use `--no-chapter-title` only when the user explicitly asks not to use chapter sequencing.
 
 ## GitHub Push Flow
 

@@ -108,12 +108,61 @@ def relative_link(readme_path: Path, target: Path) -> str:
         return Path(__import__("os").path.relpath(target, readme_path.parent)).as_posix()
 
 
+def markdown_visual_link(markdown_path: Path, visual_path: Path) -> str:
+    try:
+        target = visual_path.resolve().relative_to(markdown_path.parent.resolve()).as_posix()
+    except ValueError:
+        target = Path(__import__("os").path.relpath(visual_path, markdown_path.parent)).as_posix()
+    return target
+
+
 def move_into_directory(source: Path, target_dir: Path, dry_run: bool) -> Path:
     destination = conflict_safe_path(target_dir / source.name)
     if not dry_run:
         target_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(destination))
     return destination
+
+
+def find_article_markdown(archived_path: Path) -> Path | None:
+    if archived_path.is_file() and archived_path.suffix.lower() in {".md", ".markdown"}:
+        return archived_path
+    if not archived_path.is_dir():
+        return None
+
+    preferred_names = ["README.md", "readme.md", "index.md", "Index.md"]
+    for name in preferred_names:
+        candidate = archived_path / name
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    markdown_files = sorted(
+        path for path in archived_path.rglob("*") if path.is_file() and path.suffix.lower() in {".md", ".markdown"}
+    )
+    return markdown_files[0] if markdown_files else None
+
+
+def append_visual_to_article(archived_path: Path, visual_path: Path | None, dry_run: bool) -> Path | None:
+    if visual_path is None:
+        return None
+
+    article_path = find_article_markdown(archived_path)
+    if article_path is None:
+        return None
+
+    visual_link = markdown_visual_link(article_path, visual_path)
+    marker = "<!-- archive-notes-summary-visual -->"
+    block = f"{marker}\n\n## 总结图\n\n![总结图]({visual_link})\n"
+
+    if not dry_run:
+        content = article_path.read_text(encoding="utf-8")
+        if marker in content:
+            content = re.sub(rf"{re.escape(marker)}[\s\S]*\Z", block.rstrip(), content, count=1)
+            article_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+        else:
+            article_path.write_text(content.rstrip() + "\n\n" + block, encoding="utf-8")
+
+    return article_path
 
 
 def place_visual(visual_path: Path | None, target_dir: Path, dry_run: bool) -> Path | None:
@@ -266,6 +315,7 @@ def main(argv: list[str]) -> int:
 
     archived_path = move_into_directory(source, topic_dir, args.dry_run)
     final_visual_path = place_visual(visual_source, topic_dir, args.dry_run)
+    article_visual_path = append_visual_to_article(archived_path, final_visual_path, args.dry_run)
     topic_title = slug_to_title(topic_dir.name)
     display_title = args.title.strip() if args.no_chapter_title else chapter_title(args.title, archive_root, topic_title)
     readme_path = archive_root / "README.md"
@@ -290,6 +340,7 @@ def main(argv: list[str]) -> int:
         "archived_link": relative_link(readme_path, archived_path),
         "visual_path": str(final_visual_path) if final_visual_path else None,
         "visual_link": relative_link(readme_path, final_visual_path) if final_visual_path else None,
+        "article_visual_path": str(article_visual_path) if article_visual_path else None,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
