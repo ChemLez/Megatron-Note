@@ -1628,3 +1628,7 @@ pretrain_gpt.py
   -> pipeline schedule
   -> DDP / optimizer
 ```
+
+## 23. 总结图
+
+![Megatron-LM 架构总结图](summary-visual.png)
