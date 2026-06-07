@@ -24,9 +24,13 @@ Archive a file or folder into a notes library, update the archive README, and cr
    - Use an existing directory only when the content clearly matches its topic.
    - If confidence is low, create a new kebab-case topic directory and record the reason in the README entry.
 5. Move the source by default. Do not copy unless the user explicitly asks for copying.
-6. Run `scripts/archive_note.py` to perform deterministic filesystem and README updates. The model is responsible for classification, title, summary, and archive reason; the script performs creation, moving, conflict-safe naming, and README maintenance.
-7. Generate a visual summary by default unless the user explicitly says not to generate one. Use the `imagegen` skill / built-in image generation path for a project-bound PNG/JPG, then save it in the same archive directory as the note and add its path to README.
-8. Report the archived path, README path, visual summary path if generated, and verification results. After all implementation or archive work is complete, ask whether the user wants to push the resulting changes to remote GitHub; do not push without explicit confirmation.
+6. Create a content-based title core before archiving:
+   - Summarize the note into a concise Chinese title that names the main technical topic or learning outcome.
+   - Do not include a chapter prefix in the title you pass to the script; pass only the title core, such as `Megatron训练入口与初始化主链`.
+   - Let the script add the next `第N章：` prefix by reading the target topic's existing README entries.
+7. Run `scripts/archive_note.py` to perform deterministic filesystem and README updates. The model is responsible for classification, title core, summary, and archive reason; the script performs creation, moving, conflict-safe naming, chapter-title sequencing, and README maintenance.
+8. Generate a visual summary by default unless the user explicitly says not to generate one. Use the `imagegen` skill / built-in image generation path for a project-bound PNG/JPG, then save it in the same archive directory as the note and add its path to README.
+9. Report the archived path, README path, final chapter title, visual summary path if generated, and verification results. After all implementation or archive work is complete, ask whether the user wants to push the resulting changes to remote GitHub; do not push without explicit confirmation.
 
 ## README Format
 
@@ -39,7 +43,7 @@ Maintain the archive root `README.md` as a topic directory index. If it does not
 
 ### <Topic Name>
 
-- <YYYY-MM-DD> [<Title>](relative/path) - <one-sentence summary>
+- <YYYY-MM-DD> [第N章：<Content-Based Title>](relative/path) - <one-sentence summary>
   - Reason: <why this topic directory was chosen or created>
   - Visual: [summary image](relative/path)
 ```
@@ -47,6 +51,8 @@ Maintain the archive root `README.md` as a topic directory index. If it does not
 Rules:
 - Keep topic headings in alphabetical order when practical.
 - Add new entries under the chosen topic, newest first.
+- Titles must continue the chapter sequence within the selected topic: `第一章：...`, `第二章：...`, `第三章：...`.
+- If a README already contains chapter entries for that topic, use the next chapter number under that topic; new topics start at `第一章`.
 - Omit `Visual:` only when the user opted out or generation failed.
 - Keep summaries concise and specific to the archived note.
 
@@ -76,13 +82,13 @@ python /Users/liz/.codex/skills/archive-notes/scripts/archive_note.py \
   --source <source-path> \
   --archive-root <archive-root> \
   --topic-dir <topic-dir-name-or-path> \
-  --title "<title>" \
+  --title "<content-based-title-core>" \
   --summary "<one-sentence summary>" \
   --reason "<why this directory was selected or created>" \
   --visual-path <optional-generated-image-path>
 ```
 
-The script prints JSON containing the final archived path, topic directory, README path, and relative links. Use `--dry-run` to preview without moving files or writing README.
+The script adds the next `第N章：` prefix by default and prints JSON containing the final chapter title, archived path, topic directory, README path, and relative links. Use `--dry-run` to preview without moving files or writing README. Use `--no-chapter-title` only when the user explicitly asks not to use chapter sequencing.
 
 ## GitHub Push Flow
 
