@@ -1,4 +1,4 @@
-# Megatron-LM 架构学习笔记
+# 第一章：Megatron-LM架构与源码学习路线
 
 > 面向 Megatron-LM 初学者。本文基于当前仓库 `Megatron-LM` 源码梳理，重点关注 GPT 预训练主链路、通信组初始化、数据流、Transformer 模型结构、Tensor Parallel Linear、Attention、MLP、Pipeline 并行、DDP 与优化器。建议先沿 dense GPT 路线学习，暂时跳过 MoE、RL、多模态、推理优化等高级分支。
 
@@ -1628,4 +1628,3 @@ pretrain_gpt.py
   -> pipeline schedule
   -> DDP / optimizer
 ```
-
