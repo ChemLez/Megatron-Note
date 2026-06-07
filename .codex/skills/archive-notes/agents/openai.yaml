@@ -1,0 +1,4 @@
+interface:
+  display_name: "Archive Notes"
+  short_description: "Archive notes with README and visual summaries"
+  default_prompt: "Use $archive-notes to archive this note into my notes library and update the README."
