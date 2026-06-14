@@ -373,7 +373,166 @@ else           -> GPTDataset
 
 本文重点看普通 GPT 预训练，即 `GPTDataset`。
 
-### 3.2 `GPTDatasetConfig`
+### 3.2 SFT / 预训练与 packing / non-packing 的区别
+
+在继续看 `GPTDatasetConfig` 之前，先区分四种容易混淆的数据组织方式：
+
+```text
+SFT 非 packing
+SFT packing
+预训练非 packing
+预训练 packing
+```
+
+它们都可能产出固定长度的 `seq_length` 输入，但“固定长度 block 里装的是什么”并不一样。
+
+#### 3.2.1 SFT 非 packing
+
+SFT 数据通常是指令或对话样本，例如：
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are helpful."},
+    {"role": "user", "content": "解释一下 attention。"},
+    {"role": "assistant", "content": "Attention 是一种..."}
+  ]
+}
+```
+
+SFT 的训练目标通常不是让所有 token 都参与 loss，而是：
+
+```text
+system / user prompt: loss_mask = 0
+assistant answer:     loss_mask = 1
+padding:              loss_mask = 0
+```
+
+非 packing SFT 的做法是“一条对话样本对应一个训练 row”：
+
+```text
+sample A 长度 2000 -> right pad 到 4096
+sample B 长度  800 -> right pad 到 4096
+sample C 长度 5000 -> truncate 到 4096
+```
+
+DataLoader stack 后：
+
+```text
+tokens:       [micro_batch, seq_length]
+labels:       [micro_batch, seq_length]
+loss_mask:    [micro_batch, seq_length]
+position_ids: [micro_batch, seq_length]
+```
+
+这种方式的优点是简单：样本之间天然在 batch 维度上隔离，不需要额外记录子序列边界。缺点是 padding 浪费大，尤其当大量 SFT 样本远短于 `seq_length` 时，很多算力都花在 padding token 上。
+
+#### 3.2.2 SFT packing
+
+SFT packing 会把多条短对话样本放进同一个 `seq_length` block：
+
+```text
+block = sample A + sample B + sample C + padding
+```
+
+同时记录每条样本在 block 内的边界：
+
+```text
+cu_seqlens = [0, len(A), len(A)+len(B), len(A)+len(B)+len(C), seq_length]
+```
+
+此时一个 batch row 里可能包含多条 SFT 样本。为了避免样本之间互相看到上下文，attention 需要知道边界：
+
+```text
+sample B 只能 attend sample B 内部 token
+sample C 只能 attend sample C 内部 token
+```
+
+边界可以通过 dense `attention_mask` 表达，也可以通过 `cu_seqlens` / `PackedSeqParams` 交给 packed / varlen attention kernel。Megatron 当前 SFT 路径倾向于 packed sequence：`args.sft` 时使用 `SFTDataset`，并通过 `cu_seqlens`、`max_seqlen` 等字段描述 pack 内部的子序列。
+
+SFT packing 的优点是 token 利用率高，只在 block 尾部 padding；缺点是工程复杂度更高，DataLoader、position ids、RoPE、attention kernel、PP/CP 通信都需要理解 packed sequence 元数据。
+
+#### 3.2.3 预训练非 packing
+
+普通 GPT 预训练中的“非 packing”不是“一条文档单独 pad 到 `seq_length`”。Megatron 的 `GPTDataset` 更接近连续 token stream 切块：
+
+```text
+doc A + EOD + doc B + EOD + doc C + EOD + ...
+```
+
+然后按 `seq_length + 1` 取样：
+
+```text
+text   = token_stream[i : i + seq_length + 1]
+tokens = text[:-1]
+labels = text[1:]
+```
+
+如果 `doc A` 只有 2000 token，而 `seq_length=4096`，默认不会把 `doc A` 单独 pad 到 4096，而是继续拼接后面的文档 token：
+
+```text
+tokens = doc A + EOD + doc B + EOD + doc C 的一部分
+```
+
+如果某个文档长度超过 `seq_length`，它也不会作为一条样本被简单截断后丢弃剩余部分，而是会跨多个训练样本继续出现。
+
+默认不开 `reset_attention_mask` 时，EOD 只是 token 流里的特殊 token，普通 causal attention 不会自动隔断文档：
+
+```text
+doc B 的 token 可以 attend 到 doc A 的 token
+```
+
+这种方式简单、吞吐高、token 利用率也高，是 GPT 预训练中最常见的基本数据组织方式。
+
+#### 3.2.4 预训练 packing
+
+预训练 packing 也会把多个较短文档或样本放入同一个固定长度 block，但和普通 token stream 切块的区别是：它显式保留文档/样本边界，并在 attention 语义上隔离这些边界。
+
+```text
+block = doc A + EOD + doc B + EOD + doc C + padding
+```
+
+边界可以表示为：
+
+```text
+EOD 位置
+actual_seq_len
+cu_seqlens
+attention_mask 中的 block 边界
+```
+
+如果开启 `reset_attention_mask`：
+
+```text
+doc B 不能 attend 到 doc A
+doc C 不能 attend 到 doc A / doc B
+```
+
+如果同时开启 `reset_position_ids`：
+
+```text
+每个 EOD 后的 position ids 重新从 0 开始
+```
+
+因此，预训练 packing 的语义是“固定长度容器 + 子序列边界隔离”。它兼顾 token 利用率和样本隔离，但需要生成额外边界信息。普通 Megatron 可以用 dense attention mask 表达 EOD reset；MindSpeed 的 EOD reset / THD 路径则会把 EOD 位置转换成 `actual_seq_len` / `cu_seqlens` 一类元数据，交给 FlashAttention 或 packed sequence kernel 使用。
+
+四种方式可以用下面这张表概括：
+
+| 数据类型 | 非 packing | packing |
+| --- | --- | --- |
+| SFT | 一条对话/指令样本独占一个 row，短了 pad，长了 truncate | 多条对话/指令样本拼进一个 row，用 `cu_seqlens` / mask 隔离边界 |
+| 预训练 | 连续 token stream 按 `seq_length` 切块，短文档接后续文档，默认可跨 EOD attend | 多个文档/样本拼进一个 block，用 EOD / `actual_seq_len` / `cu_seqlens` / mask 隔离边界 |
+
+一句话记忆：
+
+```text
+SFT 非 pack：一条对话一个样本，padding 浪费较多。
+SFT pack：多条对话拼一个 block，保留边界，减少 padding。
+预训练非 pack：整份语料当 token 流连续切块，默认不隔离 EOD。
+预训练 pack：多个文档拼一个 block，但用边界信息隔离文档。
+```
+
+### 3.3 `GPTDatasetConfig`
 
 `core_gpt_dataset_config_from_args()` 会把命令行参数整理成 `GPTDatasetConfig`。
 
@@ -442,7 +601,7 @@ seq_length + 1
 
 因为 labels 是 tokens 右移一位。
 
-### 3.3 train/valid/test split
+### 3.4 train/valid/test split
 
 命令行常见参数：
 
@@ -474,7 +633,7 @@ sample_index
 shuffle_index
 ```
 
-### 3.4 多数据源 blend
+### 3.5 多数据源 blend
 
 如果使用多个数据源：
 
@@ -2153,3 +2312,5 @@ PP:
 ## 总结图
 
 ![总结图](summary-visual-v2.png)
+
+![中文总结图](summary-visual-v2.1.png)
