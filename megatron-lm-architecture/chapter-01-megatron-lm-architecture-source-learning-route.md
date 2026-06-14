@@ -1631,4 +1631,4 @@ pretrain_gpt.py
 
 ## 23. 总结图
 
-![Megatron-LM 架构总结图](summary-visual.png)
+![Megatron-LM 架构总结图](../summary_images/chapter-01-megatron-lm-architecture-source-learning-route.png)

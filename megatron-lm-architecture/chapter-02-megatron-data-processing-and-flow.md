@@ -2311,6 +2311,6 @@ PP:
 
 ## 总结图
 
-![总结图](summary-visual-v2.png)
+![总结图](../summary_images/chapter-02-megatron-data-processing-and-flow.png)
 
-![中文总结图](summary-visual-v2.1.png)
+![中文总结图](../summary_images/chapter-02-megatron-data-processing-and-flow-zh.png)

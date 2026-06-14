@@ -2372,4 +2372,4 @@ rank 布局由 order 决定：
 
 ## 总结图
 
-![总结图](summary-visual-v3.png)
+![总结图](../summary_images/chapter-03-initialization-and-parallel-groups.png)
