@@ -756,7 +756,376 @@ Outer ring:
   position 3: [3, 7]
 ```
 
-### 6.3 双层循环代码
+如果扩展到 16 个 CP ranks，并且仍然让 `inner_size = 4`，则 `outer_size = 4`：
+
+```text
+cp_size = 16, inner_size = 4, outer_size = 4
+
+Inner ring 0: [0,  1,  2,  3 ]  ← window 0
+Inner ring 1: [4,  5,  6,  7 ]  ← window 1
+Inner ring 2: [8,  9,  10, 11]  ← window 2
+Inner ring 3: [12, 13, 14, 15]  ← window 3
+
+Outer KV ring:
+  position 0: [0, 4, 8, 12]
+  position 1: [1, 5, 9, 13]
+  position 2: [2, 6, 10, 14]
+  position 3: [3, 7, 11, 15]
+```
+
+对 rank 0 来说：
+
+```text
+rank 0:
+  cp_inner_ranks = [0, 1, 2, 3]
+  cp_outer_ranks = [0, 4, 8, 12]
+
+j=0: 处理 window 0 内部 KV
+  KV 顺序: [0, 3, 2, 1]
+  outer 通信提前接收下一组 window 的同位置 KV[12]
+
+j=1: 处理 window 3 内部 KV
+  KV 顺序: [12, 15, 14, 13]
+  outer 通信提前接收 KV[8]
+
+j=2: 处理 window 2 内部 KV
+  KV 顺序: [8, 11, 10, 9]
+  outer 通信提前接收 KV[4]
+
+j=3: 处理 window 1 内部 KV
+  KV 顺序: [4, 7, 6, 5]
+
+总计: rank 0 处理 [0, 3, 2, 1, 12, 15, 14, 13, 8, 11, 10, 9, 4, 7, 6, 5]
+```
+
+这里 outer KV ring 的轮转方向和单层 Ring 一样，都是从 `prev` 接收，所以 rank 0 的 outer window 访问顺序是 `0 -> 12 -> 8 -> 4`。每进入一个 outer window 后，再在该 window 内沿 inner ring 访问 `base -> base+3 -> base+2 -> base+1`。
+
+对 rank 1 来说，它和 rank 0 位于同一个 inner window，但 outer KV ring 列换成 position 1：
+
+```text
+rank 1:
+  cp_inner_ranks = [0, 1, 2, 3]
+  cp_outer_ranks = [1, 5, 9, 13]
+
+j=0: 处理 window 0 内部 KV
+  KV 顺序: [1, 0, 3, 2]
+  outer 通信提前接收下一组 window 的同位置 KV[13]
+
+j=1: 处理 window 3 内部 KV
+  KV 顺序: [13, 12, 15, 14]
+  outer 通信提前接收 KV[9]
+
+j=2: 处理 window 2 内部 KV
+  KV 顺序: [9, 8, 11, 10]
+  outer 通信提前接收 KV[5]
+
+j=3: 处理 window 1 内部 KV
+  KV 顺序: [5, 4, 7, 6]
+
+总计: rank 1 处理 [1, 0, 3, 2, 13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6]
+```
+
+可以把 rank1 的 inner 访问顺序理解为 `base+1 -> base+0 -> base+3 -> base+2`。它的 outer window 访问顺序是 `1 -> 13 -> 9 -> 5`，和 rank0 一样都是沿 outer KV ring 从 `prev` 方向拿下一组 KV。
+
+### 6.3 只有内环时：退化为普通 Ring Attention
+
+双层 Ring 不是另一套完全独立的算法，而是普通 Ring Attention 的分层版本。当 `inner_size = cp_size` 时：
+
+```text
+outer_size = cp_size / inner_size = 1
+
+cp_inner_ranks = cp_global_ranks
+cp_outer_ranks = cp_global_ranks 或只在逻辑上退化为单轮 outer
+```
+
+这时只有一个 inner window，所有 KV block 都在这个 inner ring 中轮转，outer ring 没有实际通信价值：
+
+```text
+cp_size = 8, inner_size = 8, outer_size = 1
+
+Inner ring:
+  [0, 1, 2, 3, 4, 5, 6, 7]
+
+Outer loop:
+  j = 0 only
+  不会发起 outer_ring.async_send_recv()
+```
+
+源码中的退化点在这里：
+
+```python
+cp_config.inner_size = len(cp_config.cp_inner_ranks)
+cp_config.outer_size = cp_config.cp_size // cp_config.inner_size
+
+for j in range(cp_config.outer_size):
+    if j < cp_config.outer_size - 1:
+        outer_ring.async_send_recv(cur_kv, next_round_kv, ...)
+
+    for i in range(cp_config.inner_size):
+        if i < cp_config.inner_size - 1:
+            inner_ring.async_send_recv(cur_kv, next_kv, ...)
+        compute_fused_attention(...)
+```
+
+当 `outer_size = 1`：
+
+```text
+for j in range(1):
+  只执行 j=0
+
+j < outer_size - 1
+  等价于 0 < 0，恒为 False
+  所以 outer_ring.async_send_recv 不会执行
+
+for i in range(cp_size):
+  inner ring 完成 cp_size 轮 KV 访问
+```
+
+以 `cp_size=8` 的 rank0 为例，普通 Ring Attention 的 KV 顺序就是：
+
+```text
+rank 0:
+  cp_inner_ranks = [0, 1, 2, 3, 4, 5, 6, 7]
+  outer_size = 1
+
+j=0:
+  i=0: compute KV[0], recv KV[7]
+  i=1: compute KV[7], recv KV[6]
+  i=2: compute KV[6], recv KV[5]
+  i=3: compute KV[5], recv KV[4]
+  i=4: compute KV[4], recv KV[3]
+  i=5: compute KV[3], recv KV[2]
+  i=6: compute KV[2], recv KV[1]
+  i=7: compute KV[1]
+
+总计: rank 0 处理 [0, 7, 6, 5, 4, 3, 2, 1]
+```
+
+这和前面单层 Ring 的公式一致：
+
+```python
+next_kv_block_id = (current_kv_block_id + P - 1) % P
+```
+
+所以可以这样理解：
+
+```text
+普通 Ring:
+  一个大 inner ring 覆盖全部 CP ranks
+  通信步数是 cp_size - 1
+  每一步都在同一个 ring 上收发 KV
+
+双层 Ring:
+  把大 ring 切成 outer_size 个 inner window
+  window 内用 inner ring 快速轮转
+  window 间用 outer ring 交换下一组 KV
+  outer 通信尽量被 inner 计算隐藏
+```
+
+配置上，普通 Ring 和双层 Ring 使用的是同一套 `AttentionWithCp.forward()` 循环。差别只在 `cp_inner_ranks` 的长度：
+
+```text
+普通 Ring:
+  len(cp_inner_ranks) == cp_size
+  outer_size == 1
+
+双层 Ring:
+  len(cp_inner_ranks) == cp_window_size
+  outer_size == cp_size / cp_window_size
+```
+
+### 6.4 Ring 配置初始化与通信域设置
+
+Ring Attention 真正进入 `AttentionWithCp.forward()` 之前，通信配置已经分三层准备好了：
+
+```text
+parallel_state / model_parallel_utils
+  -> 初始化 CP 全局通信组、double ring intra/inter rank 列表
+
+dot_product_attention.py
+  -> 把当前 attention 需要的 CP 配置收集到 cp_para
+
+AttentionWithCpConfig.init_from_para(cp_para)
+  -> 把 cp_para 转成 forward/backward 共用的 cp_config
+```
+
+#### 6.4.1 double ring 通信域初始化
+
+MindSpeed 在并行组初始化阶段调用 `initialize_context_parallel_group_for_double_ring()`。这个函数只在以下条件下生效：
+
+```text
+context_parallel_size > 1
+context_parallel_algo in ['megatron_cp_algo', 'hybrid_cp_algo']
+tp_2d == False
+```
+
+核心逻辑是把当前 CP ranks 先按 `args.cp_window_size` 切成若干 intra window：
+
+```python
+ring_size = len(ring_global_ranks)
+window_size = args.cp_window_size
+inter_size = ring_size // window_size
+
+for wid in range(inter_size):
+    intra_ranks = ring_global_ranks[wid * window_size : (wid + 1) * window_size]
+    intra_group = torch.distributed.new_group(intra_ranks, ...)
+```
+
+如果当前 rank 落在某个 `intra_ranks` 中，就记录：
+
+```text
+_CONTEXT_PARALLEL_RANKS_FOR_RING_INTRA_WINDOW
+_CONTEXT_PARALLEL_GROUP_FOR_RING_INTRA_WINDOW
+_CONTEXT_PARALLEL_GROUP_FOR_RING_INTRA_WINDOW_SEND_RECV_OVERLAP
+```
+
+随后再按每个 inner position 生成 outer KV ring：
+
+```python
+for inner_id in range(window_size):
+    inter_ranks = [ring_global_ranks[idx] for idx in range(inner_id, ring_size, window_size)]
+```
+
+以 `cp_size=16, window_size=4` 为例：
+
+```text
+inner_id=0 -> [0, 4, 8, 12]
+inner_id=1 -> [1, 5, 9, 13]
+inner_id=2 -> [2, 6, 10, 14]
+inner_id=3 -> [3, 7, 11, 15]
+```
+
+forward 的 outer KV 通信使用的是这个 `inter_ranks`。Backward 中 DKV 的 outer ring 还会单独生成 `_CONTEXT_PARALLEL_RANKS_FOR_RING_INTER_WINDOW_DKV`，它不是简单的同位置列，而是按源码中的 `cur_window / cur_idx` 规则交错生成，用来配合反向梯度回传。
+
+#### 6.4.2 cp_para 的组装
+
+进入 attention wrapper 后，`dot_product_attention.py` 先解析当前 CP 通信域：
+
+```python
+cp_group = parallel_state.get_context_parallel_group()
+cp_size = parallel_state.get_context_parallel_world_size()
+rank = parallel_state.get_context_parallel_rank()
+cp_global_ranks = parallel_state.get_context_parallel_global_ranks()
+```
+
+对于 `hybrid_cp_algo`，如果已经初始化 hybrid ring，则会改用：
+
+```python
+cp_group = get_context_parallel_group_for_hybrid_ring()
+cp_size = get_context_parallel_for_hybrid_ring_world_size()
+rank = get_context_parallel_for_hybrid_ring_rank()
+cp_global_ranks = get_context_parallel_for_hybrid_ring_global_ranks()
+```
+
+随后组装 `cp_para`：
+
+```python
+cp_para = {}
+cp_para['megatron_cp_in_bnsd'] = self.config.megatron_cp_in_bnsd
+cp_para['causal'] = self.config.attention_mask_type == 'causal'
+cp_para['cp_group'] = cp_group
+cp_para['cp_size'] = cp_size
+cp_para['rank'] = rank
+cp_para['cp_global_ranks'] = cp_global_ranks
+```
+
+如果打开 `--use-cp-send-recv-overlap`，还会带上用于 P2P overlap 的通信组：
+
+```python
+cp_para['cp_group_for_send_recv_overlap'] = (
+    parallel_state.get_context_parallel_group_for_send_recv_overlap()
+)
+```
+
+对于 Ring / Megatron CP，还会注入 double ring 专用字段：
+
+```python
+cp_para['cp_inner_ranks'] = get_ring_ranks_for_intra_window()
+cp_para['cp_outer_ranks'] = get_ring_ranks_for_inter_window_kv()
+cp_para['cp_dkv_outer_ranks'] = get_ring_ranks_for_inter_window_dkv()
+cp_para['cp_group_for_intra_window'] = get_ring_group_for_intra_window()
+cp_para['cp_group_for_intra_window_send_recv_overlap'] = (
+    get_ring_group_for_intra_window_send_recv_overlap()
+)
+cp_para['cache_policy'] = get_cache_policy(...)
+```
+
+这几个字段对应关系如下：
+
+| 字段 | 含义 | 用途 |
+|------|------|------|
+| `cp_group` | 当前 CP 或 hybrid ring 的主通信组 | outer ring KV 轮转 |
+| `cp_global_ranks` | 当前 CP ring 的全部 global ranks | 默认 outer ranks、rank id 映射 |
+| `cp_inner_ranks` | 当前 rank 所在 intra window | inner ring KV 轮转 |
+| `cp_outer_ranks` | 当前 inner position 对应的 inter window KV ring | forward outer KV 轮转 |
+| `cp_dkv_outer_ranks` | backward DKV 使用的 inter ring | backward 梯度轮转 |
+| `cp_group_for_send_recv_overlap` | CP 级 P2P overlap group | outer ring 可选 overlap |
+| `cp_group_for_intra_window` | intra window 通信组 | inner ring 主通信域 |
+| `cp_group_for_intra_window_send_recv_overlap` | intra window overlap group | inner ring 可选 overlap |
+
+#### 6.4.3 AttentionWithCpConfig.init_from_para(cp_para)
+
+`AttentionWithCpConfig.init_from_para()` 本身不创建通信组，它只是把 `cp_para` 中已经准备好的字段收进 dataclass 风格的配置对象：
+
+```python
+@classmethod
+def init_from_para(cls, cp_para):
+    return cls(
+        causal=cp_para['causal'],
+        cp_group=cp_para.get("cp_group"),
+        cp_size=cp_para.get("cp_size"),
+        rank=cp_para.get("rank"),
+        cp_global_ranks=cp_para.get("cp_global_ranks"),
+        cp_inner_ranks=cp_para.get("cp_inner_ranks", [torch.distributed.get_rank()]),
+        cp_group_for_send_recv_overlap=cp_para.get("cp_group_for_send_recv_overlap"),
+        cp_group_for_intra_window=cp_para.get('cp_group_for_intra_window'),
+        cp_group_for_intra_window_send_recv_overlap=cp_para.get(
+            'cp_group_for_intra_window_send_recv_overlap'
+        ),
+        megatron_cp_in_bnsd=cp_para.get('megatron_cp_in_bnsd'),
+        cache_policy=cp_para.get("cache_policy"),
+        pse=cp_para.get("pse"),
+        pse_type=cp_para.get("pse_type")
+    )
+```
+
+进入 `AttentionWithCp.forward()` 后，再补齐派生配置：
+
+```python
+cp_config = AttentionWithCpConfig.init_from_para(cp_para)
+cp_config.cp_outer_ranks = cp_para.get("cp_outer_ranks", cp_config.cp_global_ranks)
+cp_config.inner_size = len(cp_config.cp_inner_ranks)
+cp_config.outer_size = cp_config.cp_size // cp_config.inner_size
+cp_config.keep_prob = 1. - dropout_p
+```
+
+然后根据 rank 列表和通信组实例化两个 `RingP2P`：
+
+```python
+inner_ring = RingP2P(
+    cp_config.cp_inner_ranks,
+    cp_config.cp_group_for_intra_window,
+    cp_config.cp_group_for_intra_window_send_recv_overlap,
+)
+
+outer_ring = RingP2P(
+    cp_config.cp_outer_ranks,
+    cp_config.cp_group,
+    cp_config.cp_group_for_send_recv_overlap,
+)
+```
+
+`RingP2P` 会根据当前 global rank 在 `ring_global_ranks` 中的位置计算相邻 peer：
+
+```python
+ring_rank = ring_global_ranks.index(global_rank)
+self.next = ring_global_ranks[(ring_rank + 1) % ring_size]
+self.prev = ring_global_ranks[(ring_rank + ring_size - 1) % ring_size]
+```
+
+如果传入了 overlap group，`RingP2P` 会保留主 group 和 overlap group 两套通信域。源码中偶数/奇数 ring rank 会交错选择 `isend/irecv` 使用哪个 group，以降低 send/recv 阻塞和通信-计算重叠时的互相等待。
+
+### 6.5 双层循环代码
 
 ```python
 for j in range(outer_size):  # 外层：跨组循环
@@ -789,7 +1158,7 @@ for j in range(outer_size):  # 外层：跨组循环
         kv_block_id_outer = next_kv_block_id_outer
 ```
 
-### 6.4 KV 处理顺序示例
+### 6.6 KV 处理顺序示例
 
 ```text
 rank 0 (inner ring 0, outer position 0):
@@ -814,7 +1183,7 @@ j=1 (处理 inner ring 1):
 总计: rank 0 处理了 [0, 3, 2, 1, 4, 7, 6, 5]
 ```
 
-### 6.5 通信隐藏时间线
+### 6.7 通信隐藏时间线
 
 ```text
 j=0:
@@ -840,7 +1209,7 @@ j=0:
 
 Outer 通信（跨节点，延迟大）在 inner 循环开始前发起，整个 inner_size 次 attention 计算期间都在后台进行。只要 inner 循环的总计算时间 > outer 通信时间，outer 通信就完全免费。
 
-### 6.6 Double Buffer 机制
+### 6.8 Double Buffer 机制
 
 ```python
 cur_kv = 当前正在计算的 KV block
