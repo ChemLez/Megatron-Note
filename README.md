@@ -4,7 +4,7 @@
 
 ### Context Parallel
 
-- 2026-06-21 [第二章：MindSpeed Ring Attention上下文并行方案详解](features/context_parallel/mindspeed-ring-attention-context-parallel-guide.md) - 系统梳理 MindSpeed Ring Attention CP 的 zigzag 切分、KV 环形轮转、causal case 分发、Case 1 mask 与 pre_tokens/next_tokens 接入、在线 softmax 合并和双层 Ring 通信隐藏机制。
+- 2026-06-21 [第二章：MindSpeed Ring Attention上下文并行方案详解](features/context_parallel/chapter-02-mindspeed-ring-attention-context-parallel.md) - 系统梳理 MindSpeed Ring Attention CP 的 zigzag 切分、KV 环形轮转、causal case 分发、Case 1 mask 与 pre_tokens/next_tokens 接入、在线 softmax 合并和双层 Ring 通信隐藏机制。
   - Reason: 该笔记聚焦 MindSpeed Ring Attention 风格的 Context Parallel 实现，和现有 Context Parallel 专题中的 Ulysses 方案形成互补，适合作为 Ring/P2P CP 章节归档。
   - Visual: [summary image](summary_images/chapter-02-mindspeed-ring-attention-context-parallel.png)
 
