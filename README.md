@@ -4,6 +4,10 @@
 
 ### Context Parallel
 
+- 2026-06-25 [第三章：MindSpeed DeepSeek V4 CP方案实现与接入](features/context_parallel/chapter-03-mindspeed-deepseek-v4-context-parallel.md) - 系统梳理 MindSpeed DeepSeek V4 CP 的生产者/消费者边界、两阶段通信、candidate block 选择、compressed KV allgather、SMLA 算子接入、compress_fn 契约与第三方模型框架接入路径。
+  - Reason: 该笔记聚焦 MindSpeed 下 DeepSeek V4 Context Parallel 能力的实现架构和模型框架接入规范，和现有 Ulysses、Ring Attention CP 章节形成互补，适合作为 Context Parallel 专题第三章归档。
+  - Visual: [summary image](summary_images/chapter-03-mindspeed-deepseek-v4-context-parallel.png)
+
 - 2026-06-21 [第二章：MindSpeed Ring Attention上下文并行方案详解](features/context_parallel/chapter-02-mindspeed-ring-attention-context-parallel.md) - 系统梳理 MindSpeed Ring Attention CP 的 zigzag 切分、KV 环形轮转、causal case 分发、Case 1 mask 与 pre_tokens/next_tokens 接入、在线 softmax 合并和双层 Ring 通信隐藏机制。
   - Reason: 该笔记聚焦 MindSpeed Ring Attention 风格的 Context Parallel 实现，和现有 Context Parallel 专题中的 Ulysses 方案形成互补，适合作为 Ring/P2P CP 章节归档。
   - Visual: [summary image](summary_images/chapter-02-mindspeed-ring-attention-context-parallel.png)
