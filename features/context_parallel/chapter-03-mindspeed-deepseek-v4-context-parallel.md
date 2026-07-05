@@ -52,9 +52,9 @@ flowchart TD
     end
 
     subgraph MindSpeed["MindSpeed DS V4 CP Producer"]
-        E["可选 original-window exchange\nexchange_deepseek_v4_previous_window\n仅处理 ori_kv, 不参与 compressed block slicing"]
+        E["original-window exchange\nexchange_deepseek_v4_previous_window\n类入口传 window_size 时自动调用\n其他入口需上层显式调用\n仅处理 ori_kv, 不参与 compressed block slicing"]
         F["prepare_deepseek_v4_compressed_kv_for_cp"]
-        X["compressed-source P2P tail exchange\n_ReceivePreviousTail.apply"]
+        X["compressed-source P2P tail exchange\n_ReceivePreviousTail.apply\n含 R14 rank-0 死锁修复"]
         G["压缩候选块切分与归属判定\ncandidate block slicing / ownership"]
         H["compress_fn(candidate_blocks, context)"]
         I["AllGather compressed KV + metadata"]
@@ -84,7 +84,7 @@ flowchart TD
     G --> H
     H --> I
     I --> J
-    B -- "上层显式可选调用: original KV 局部窗口补齐" --> E
+    B -- "类入口传 window_size 时自动调用\n其他入口上层显式调用: original KV 局部窗口补齐" --> E
     E --> J
     J --> O
     O -- "ratio == 4" --> P
@@ -118,7 +118,7 @@ flowchart TD
 | `Lightning Indexer / C4A index_scores` | 仅用于 C4A/CSA 路径的模型侧打分逻辑，负责给每个 query 对每个 compact compressed block 打分。HCA/C128A 不使用该节点。 | query index、key index、weights、mask 等模型侧信息 | `index_scores` | Consumer |
 | `DeepSeekV4CPRuntimeInputs` | 模型框架与 MindSpeed bridge 之间的运行时契约，用一个结构集中携带 `q`、`ori_kv`、`compress_source`、`compress_fn`、`prepared_compressed_kv`、`index_scores`、`cu_seqlens`、layout 等字段。 | Consumer 侧产物 | bridge 可消费的标准输入 | Consumer |
 | `run_deepseek_v4_cp_sparse_attention` | MindSpeed tensor-level bridge，串联 compressed KV 准备、SMLA input 构造和 SparseFlashMla 调用。 | `DeepSeekV4CPRuntimeInputs` 或等价参数 | attention 输出 | MindSpeed |
-| `exchange_deepseek_v4_previous_window` | 可选 original-window helper，从前一个 CP rank 接收尾部窗口，并拼到当前 rank `ori_kv` 前面，用于补齐跨 rank 的 SWA 左窗口。当前 bridge 不会自动调用它。 | 当前 rank 本地 `ori_kv` 或等价 original-window tensor | 带前序窗口的 original-window tensor | MindSpeed |
+| `exchange_deepseek_v4_previous_window` | original-window helper，从前一个 CP rank 接收尾部窗口，并拼到当前 rank `ori_kv` 前面，用于补齐跨 rank 的 SWA 左窗口。类入口（`DeepSeekV4CPContextParallel.forward`）传 `window_size` 时自动调用；其他入口需上层显式调用。含 R14 rank-0 死锁修复。 | 当前 rank 本地 `ori_kv` 或等价 original-window tensor | 带前序窗口的 original-window tensor | MindSpeed |
 | `prepare_deepseek_v4_compressed_kv_for_cp` | compressed KV 准备主函数，负责 compressed-source P2P tail exchange、candidate block 切分、调用模型 `compress_fn`、allgather compressed KV 与 metadata。自动 bridge 路径使用显式 `compress_source`，不会把 `ori_kv` 当作默认压缩源。 | compressed source、`compress_fn`、CP group、`cu_seqlens` | `DeepSeekV4CPCompressedKV` | MindSpeed |
 | `compressed-source P2P tail exchange` | `prepare_deepseek_v4_compressed_kv_for_cp` 内部的第一阶段通信，先接收前一个 CP rank 的 tail，再拼出 `extended_kv`，供后续 candidate block 切分使用。 | 当前 rank compressed source | `extended_kv = prev_tail + local_source` | MindSpeed |
 | `压缩候选块切分与归属判定` | 根据 `compression_ratio`、`local_seq_offset`、`cu_seqlens` 计算当前 rank 应压缩哪些原始 token block。它属于 compressed KV 生产阶段，不依赖 `index_scores`，也不是 C4A top-k。 | 本地序列、前序 tail、压缩比、sample 边界 | `candidate_blocks`、`candidate_starts`、`valid_mask` | MindSpeed |
@@ -144,7 +144,7 @@ flowchart TD
 | 9 | `压缩候选块切分与归属判定 -> compress_fn(candidate_blocks, context)` | MindSpeed 将候选原始 token block 交给模型侧 compressor 回调。该选择只决定“哪些 block 要被压缩、由哪个 rank 负责压缩”，不需要 Lightning Indexer 或 `index_scores`。 |
 | 10 | `compress_fn(candidate_blocks, context) -> AllGather compressed KV + metadata` | 模型 compressor 返回本 rank 的 compressed KV 后，MindSpeed 先 mask 无效 candidate，再跨 CP rank allgather compressed KV 与 metadata。 |
 | 11 | `AllGather compressed KV + metadata -> build_deepseek_v4_cp_smla_inputs` | MindSpeed 将 gathered compressed KV compact 成连续 `cmp_kv`，并保留与 compact 顺序一致的 `block_starts`。这是 C4A index 对齐的关键步骤。 |
-| 12 | `PreAttention: q / ori_kv -> exchange_deepseek_v4_previous_window` | 对需要 original KV 左窗口上下文的场景，上层可显式调用该 helper，让 MindSpeed 从前一 CP rank 拼接 `ori_kv` 尾部窗口。它不是 compressed KV candidate 切分前的内部 tail exchange。 |
+| 12 | `PreAttention: q / ori_kv -> exchange_deepseek_v4_previous_window` | 对需要 original KV 左窗口上下文的场景，类入口传 `window_size` 时自动调用该 helper；其他入口由上层显式调用，让 MindSpeed 从前一 CP rank 拼接 `ori_kv` 尾部窗口。它不是 compressed KV candidate 切分前的内部 tail exchange。 |
 | 13 | `exchange_deepseek_v4_previous_window -> build_deepseek_v4_cp_smla_inputs` | 带前序窗口的 `ori_kv` 会进入 SMLA input 构造，供 C1A/SWA 或混合 attention 使用。 |
 | 14 | `build_deepseek_v4_cp_smla_inputs -> SparseFlashMla` | MindSpeed 将 `q`、`ori_kv`、`cmp_kv`、`cu_seqlens`、residual、metadata 等打包后调用 SparseFlashMla forward。C4A 会额外带上 `cmp_sparse_indices`；C128A 不允许带 `cmp_sparse_indices`。 |
 | 15 | `SparseFlashMlaMetadata -> SparseFlashMla` | SparseFlashMla forward 需要 metadata 描述具体任务切分、layout 和稀疏模式；该 metadata 由 CANN wrapper 按输入参数生成或透传。 |
@@ -159,17 +159,24 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant Model as Model Framework
+    participant Entry as CP Entry (Class/Func)
     participant Bridge as MindSpeed DS CP Bridge
     participant CP as MindSpeed CP Runtime
     participant Fn as model-owned compress_fn
-    participant SMLA as SparseFlashMla Wrapper
+    Participant SMLA as SparseFlashMla Wrapper
     participant CANN as cann_ops_transformer
 
     Model->>Model: build q / ori_kv / compress_source / index_scores
-    Model->>Bridge: run_deepseek_v4_cp_sparse_attention(...)
+    Model->>Entry: DeepSeekV4CPContextParallel.forward(..., window_size=128)
+    Note over Entry: 类入口传 window_size 时自动做窗口交换
+    Entry->>CP: exchange_deepseek_v4_previous_window(ori_kv, window_size)
+    CP->>CP: P2P receive previous rank tail (R14 fix)
+    CP-->>Entry: windowed ori_kv + synced cu_seqlens_ori_kv
+    Entry->>Bridge: run_deepseek_v4_cp_sparse_attention(windowed ori_kv, ...)
+    Note over Bridge: 非类入口跳过窗口交换，直接进 bridge
     alt compression_ratio > 1 and no prepared_compressed_kv
         Bridge->>CP: prepare_deepseek_v4_compressed_kv_for_cp(compress_source, compress_fn)
-        CP->>CP: receive previous tail by P2P
+        CP->>CP: receive previous tail by P2P (compression_ratio tokens)
         CP->>CP: build candidate_starts and candidate_blocks
         CP->>Fn: compress_fn(candidate_blocks, context)
         Fn-->>CP: local_compressed
@@ -191,8 +198,9 @@ sequenceDiagram
 | 参与方 | 对应模块 | 职责 |
 |---|---|---|
 | `Model Framework` | MindSpeed-LLM 或第三方模型框架 | 负责模型 attention forward，生成 `q`、`ori_kv`、`index_scores`，并决定 compressor 输入源。 |
+| `CP Entry (Class/Func)` | `DeepSeekV4CPContextParallel`（类）或 `deepseek_v4_context_parallel`（函数） | 入口层。类入口传 `window_size` 时自动做窗口交换 + `cu_seqlens` 对齐；函数入口无窗口交换。两者最终都调 bridge。 |
 | `MindSpeed DS CP Bridge` | `run_deepseek_v4_cp_sparse_attention` | 负责把模型侧输入串接到 MindSpeed CP runtime 和 SparseFlashMla wrapper。 |
-| `MindSpeed CP Runtime` | `deepseek_v4_context_parallel.py` | 负责 P2P tail exchange、candidate block 选择、compressed KV allgather、metadata 和 SMLA input 构造。 |
+| `MindSpeed CP Runtime` | `_distributed.py` / `_compressed_kv.py` / `_smla_inputs.py` | 负责 P2P tail exchange、candidate block 选择、compressed KV allgather、metadata 和 SMLA input 构造。 |
 | `model-owned compress_fn` | 模型侧 compressor adapter | 负责把 MindSpeed 切出的 `candidate_blocks` 压缩为 `local_compressed`。 |
 | `SparseFlashMla Wrapper` | `npu_sparse_flash_mla.py` | 负责参数校验、layout normalize、metadata 补全和 CANN 算子调用。 |
 | `cann_ops_transformer` | 官方 CANN transformer ops | 负责执行 SparseFlashMla metadata、forward、grad 真实算子。 |
@@ -396,11 +404,12 @@ class DeepSeekV4CPCompressContext:
 flowchart LR
     A["DeepSeekV4CPRuntimeInputs"] --> B["run_deepseek_v4_cp_sparse_attention"]
     B --> C["validate_deepseek_v4_cp_runtime_inputs"]
-    C --> D["DeepSeekV4CPRuntimeMetadata"]
+    C --> C1["build_deepseek_v4_cp_runtime_metadata"]
+    C1 --> D["DeepSeekV4CPRuntimeMetadata"]
     D --> E["prepare_deepseek_v4_compressed_kv_for_cp"]
     E --> F["DeepSeekV4CPCompressedKV"]
-    F --> G["build_deepseek_v4_cp_smla_inputs"]
-    D --> G
+    D --> G["build_deepseek_v4_cp_smla_inputs"]
+    F --> G
     G --> H["DeepSeekV4CPSMLAInputs"]
     H --> I["npu_sparse_flash_mla_from_smla_inputs"]
 ```
@@ -411,11 +420,12 @@ flowchart LR
 |---|---|---|
 | `DeepSeekV4CPRuntimeInputs` | 对外契约 | 上层模型框架传给 MindSpeed 的 runtime 输入集合，包含 `q`、`ori_kv`、`compression_ratio`、`compress_source`、`compress_fn`、`prepared_compressed_kv`、`index_scores` 等字段。 |
 | `run_deepseek_v4_cp_sparse_attention` | bridge 入口 | MindSpeed DS V4 CP 的 tensor-level attention bridge，先执行 runtime input 校验，再决定是否准备 compressed KV，并串接 SMLA input 与算子调用。 |
-| `validate_deepseek_v4_cp_runtime_inputs` | 契约校验 | 统一校验 layout、tensor shape、`cu_seqlens`、`query_positions`、`compress_source`、`prepared_compressed_kv` 与压缩模式必需输入。 |
-| `DeepSeekV4CPRuntimeMetadata` | 已校验元数据 | 保存解析后的 `query_positions`、`cu_seqlens_*`、`seqused_*`、`cmp_residual_kv`、seq_dim 与 `local_seq_offset`，供 prepare 与 SMLA input 构造复用。 |
-| `prepare_deepseek_v4_compressed_kv_for_cp` | compressed KV 准备 | 在压缩模式下执行 P2P tail exchange、candidate block 选择、模型侧 `compress_fn` 调用和 compressed KV allgather。 |
+| `validate_deepseek_v4_cp_runtime_inputs` | 契约校验 | 统一校验 layout、tensor shape、`cu_seqlens`、`query_positions`、`compress_source`、`prepared_compressed_kv` 与压缩模式必需输入。内部调用 `build_deepseek_v4_cp_runtime_metadata`。 |
+| `build_deepseek_v4_cp_runtime_metadata` | 元数据构建器 | CP 包的核心元数据构建器——校验并归一化 q/ori_kv 的形状与 layout、推导 local_seq_offset、生成或校验三套 cu_seqlens（query/窗口ori_kv/全局ori_kv）、推导 query_positions、计算压缩 KV 的 cu_seqlens 和 residual、按 layout 设置 seqused。核心设计是区分 `cu_seqlens_ori_kv`（窗口张量边界）与 `cu_seqlens_ori_kv_global`（全局序列边界）。 |
+| `DeepSeekV4CPRuntimeMetadata` | 已校验元数据 | 保存解析后的 `query_positions`、`cu_seqlens_*`（含 `cu_seqlens_ori_kv` 与 `cu_seqlens_ori_kv_global`）、`seqused_*`、`cmp_residual_kv`、seq_dim 与 `local_seq_offset`，供 prepare 与 SMLA input 构造复用。 |
+| `prepare_deepseek_v4_compressed_kv_for_cp` | compressed KV 准备 | 在压缩模式下执行 P2P tail exchange（`compression_ratio` 个 token）、candidate block 选择、模型侧 `compress_fn` 调用和 compressed KV allgather。使用 `cu_seqlens_ori_kv_global`（全局边界）做 block range 划分。 |
 | `DeepSeekV4CPCompressedKV` | 中间结果 | 绑定 allgather 后的 `compressed_kv` 与 metadata，metadata 记录 `valid_mask`、`block_starts`、`source_rank` 等信息。 |
-| `build_deepseek_v4_cp_smla_inputs` | SMLA 输入构造 | 将 `q`、`ori_kv`、compact `cmp_kv`、C4A `cmp_sparse_indices`、`cu_seqlens` 和 residual 组装成算子输入。 |
+| `build_deepseek_v4_cp_smla_inputs` | SMLA 输入构造 | 将 `q`、`ori_kv`、compact `cmp_kv`、C4A `cmp_sparse_indices`、`cu_seqlens` 和 residual 组装成算子输入。复用 `runtime_metadata` 跳过重复校验。 |
 | `DeepSeekV4CPSMLAInputs` | 算子输入包 | 面向 SparseFlashMla wrapper 的结构化输入，屏蔽上游 CP metadata 与下游算子参数之间的差异。 |
 | `npu_sparse_flash_mla_from_smla_inputs` | 算子桥接 | 从 `DeepSeekV4CPSMLAInputs` 提取参数，调用 MindSpeed SMLA wrapper 和 CANN 官方算子。 |
 
@@ -424,7 +434,7 @@ flowchart LR
 | 1 | `DeepSeekV4CPRuntimeInputs -> run_deepseek_v4_cp_sparse_attention` | 模型框架把运行时输入交给 MindSpeed bridge，bridge 成为 DS V4 CP 的统一消费入口。 |
 | 2 | `run_deepseek_v4_cp_sparse_attention -> validate_deepseek_v4_cp_runtime_inputs` | bridge 先统一校验 producer/consumer 契约，避免后续 CP 通信或 SMLA 调用才暴露 layout/shape 错误。 |
 | 3 | `validate -> DeepSeekV4CPRuntimeMetadata` | 校验层返回解析后的 seq_dim、默认 query positions、compressed-side `cu_seqlens` 和 residual。 |
-| 4 | `RuntimeMetadata -> prepare_deepseek_v4_compressed_kv_for_cp` | 当 `compression_ratio > 1` 且未传入 `prepared_compressed_kv` 时，bridge 使用显式 `compress_source`、已解析的 `ori_kv_seq_dim`、`cu_seqlens_ori_kv` 和 `local_seq_offset` 准备 compressed KV。 |
+| 4 | `RuntimeMetadata -> prepare_deepseek_v4_compressed_kv_for_cp` | 当 `compression_ratio > 1` 且未传入 `prepared_compressed_kv` 时，bridge 使用显式 `compress_source`、已解析的 `ori_kv_seq_dim`、`cu_seqlens_ori_kv_global`（全局序列边界，非窗口张量边界）和 `local_seq_offset` 准备 compressed KV。 |
 | 5 | `prepare -> DeepSeekV4CPCompressedKV` | CP runtime 输出压缩后的 KV 以及与其对齐的 metadata。 |
 | 6 | `RuntimeMetadata + DeepSeekV4CPCompressedKV -> build_deepseek_v4_cp_smla_inputs` | SMLA input 构造函数复用已校验 metadata，完成 compact、packed sequence 和 C4A index 适配。 |
 | 7 | `build_deepseek_v4_cp_smla_inputs -> DeepSeekV4CPSMLAInputs` | 生成统一的 SMLA-facing 输入结构。 |
@@ -486,20 +496,21 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A["local_kv"] --> B["_move_dim(seq_dim -> 0)"]
+    A["local_kv (compress_source)"] --> B["torch.movedim(seq_dim -> 0)"]
     B --> C["_get_cp_size_and_rank"]
-    C --> D["_ReceivePreviousTail.apply"]
-    D --> E["extended_kv = prev_tail + local_kv"]
+    C --> C1["_resolve_global_ranks\nlocal→global rank 映射"]
+    C1 --> D["_ReceivePreviousTail.apply\nP2P 取前继尾部 (ratio 个 token)\n含 R14 rank-0 死锁修复"]
+    D --> E["extended_kv = cat(prev_tail, local_kv)"]
     E --> F["candidate_capacity = local_seq_len // ratio + 1"]
-    F --> G["_build_local_candidate_starts"]
-    G --> H["_select_candidate_blocks"]
+    F --> G["_build_local_candidate_starts\n按 block_end 落入本地筛选"]
+    G --> H["_select_candidate_blocks\n从 extended_kv gather 候选块"]
     H --> I["build DeepSeekV4CPCompressContext"]
-    I --> J["_call_deepseek_v4_compress_fn"]
+    I --> J["_call_deepseek_v4_compress_fn\n签名自适应 (blocks) / (blocks, context)"]
     J --> K["validate tensor and candidate_count"]
-    K --> L["mask invalid candidates"]
-    L --> M["_AllGatherCompressedKV.apply"]
-    M --> N["_all_gather_metadata"]
-    N --> O["_select_and_pad_compressed_kv"]
+    K --> L["mask invalid candidates\n(valid_mask 置零)"]
+    L --> M["_AllGatherCompressedKV.apply\nallgather + backward all_reduce"]
+    M --> N["_all_gather_metadata\n同步 valid_mask / block_starts"]
+    N --> O["_select_and_pad_compressed_kv\nnonzero + argsort + index_select + pad"]
     O --> P["DeepSeekV4CPCompressedKV"]
 ```
 
@@ -508,10 +519,11 @@ flowchart TD
 | 节点 | 说明 |
 |---|---|
 | `local_kv` | 当前 rank 的本地序列张量。在 bridge 自动准备 compressed KV 时，该张量来自显式 `compress_source`；如果模型希望基于 `hidden_states` 压缩，应把本地 hidden-state shard 作为 `compress_source`。 |
-| `_move_dim(seq_dim -> 0)` | 将序列维移动到第 0 维，统一后续 P2P、block selection 和 allgather 的处理方式。 |
+| `torch.movedim(seq_dim -> 0)` | 将序列维移动到第 0 维，统一后续 P2P、block selection 和 allgather 的处理方式。TND 是 no-op，BSND 才真搬。 |
 | `_get_cp_size_and_rank` | 获取 CP 组大小和当前 rank，用于计算全局位置和通信 peer。 |
-| `_ReceivePreviousTail.apply` | 从前一个 CP rank 接收尾部 token，同时在 backward 中把梯度传回对应 rank。 |
-| `extended_kv = prev_tail + local_kv` | 将前序 tail 拼到本地序列前，形成可覆盖跨 rank 边界 block 的输入。 |
+| `_resolve_global_ranks` | local→global rank 映射。`torch.distributed` 的 P2P API（isend/irecv）硬性要求 peer 是全局 rank，四级 fallback：显式传入 → 默认 group → `dist.get_global_rank` → 抛错。 |
+| `_ReceivePreviousTail.apply` | 从前一个 CP rank 接收尾部 `compression_ratio` 个 token，同时在 backward 中把梯度传回对应 rank。含 R14 rank-0 死锁修复（`+ 0.0` 保活 autograd 节点）。前向 send_peer=后继、recv_peer=前继；反向互换。 |
+| `extended_kv = cat(prev_tail, local_kv)` | 将前序 tail 拼到本地序列前，形成可覆盖跨 rank 边界 block 的输入。rank 0 的 prev_tail 是全零 padding（不会被 gather 到，仅占位保证索引对齐）。 |
 | `candidate_capacity` | 当前 rank 固定候选容量，公式为 `local_seq_len // ratio + 1`，多出的 1 用于容纳跨 rank 边界候选。 |
 | `_build_local_candidate_starts` | 计算当前 rank 应负责压缩的 block 全局起点，packed sequence 场景下避免跨样本压缩。 |
 | `_select_candidate_blocks` | 根据 candidate start 从 `extended_kv` 中切出待压缩 token block。 |
@@ -530,7 +542,7 @@ flowchart TD
 |---:|---|---|
 | 1 | `local_kv -> _move_dim` | 统一序列维，避免不同调用方 layout 差异影响 CP 逻辑。 |
 | 2 | `_move_dim -> _get_cp_size_and_rank` | 以 seq-first 张量为基础获取本 rank 的 CP 上下文。 |
-| 3 | `_get_cp_size_and_rank -> _ReceivePreviousTail.apply` | 根据 CP rank 找到前后 peer，执行第一阶段 P2P tail exchange。 |
+| 3 | `_get_cp_size_and_rank -> _resolve_global_ranks -> _ReceivePreviousTail.apply` | 根据 CP rank 找到前后 peer，先解析全局 rank（P2P API 硬性要求全局 rank），再执行第一阶段 P2P tail exchange。 |
 | 4 | `_ReceivePreviousTail.apply -> extended_kv` | 将收到的前序 tail 与本地序列拼接，补齐跨 rank block 所需 token。 |
 | 5 | `extended_kv -> candidate_capacity` | 先确定固定输出容量，保证不同 rank 可以安全 allgather。 |
 | 6 | `candidate_capacity -> _build_local_candidate_starts` | 计算当前 rank 负责的 compressed block 起点。 |
@@ -544,7 +556,7 @@ flowchart TD
 | 14 | `_all_gather_metadata -> _select_and_pad_compressed_kv` | 依据 `block_starts` select-and-pad，得到全局顺序稳定的 compressed KV。 |
 | 15 | `_select_and_pad_compressed_kv -> DeepSeekV4CPCompressedKV` | 输出给后续 SMLA input 构造流程。 |
 
-关键结论：这张图完整覆盖论文 CP 的两阶段通信：**先 P2P 补齐跨 rank compressed source，再 allgather compressed KV 与 metadata**。当前自动路径的 P2P 源是 `local_kv`，在 bridge 中即显式传入的 `compress_source`；`ori_kv` 只作为 SparseFlashMla 的 original KV 输入，不再被默认复用为压缩源。
+关键结论：这张图完整覆盖论文 CP 的两阶段通信：**先 P2P 补齐跨 rank compressed source（`compression_ratio` 个 token），再 allgather compressed KV 与 metadata**。当前自动路径的 P2P 源是 `local_kv`（即 bridge 中显式传入的 `compress_source`）；`ori_kv` 只作为 SparseFlashMla 的 original KV 输入，不再被默认复用为压缩源。注意这里的 P2P tail exchange（`compression_ratio` 个 token）与窗口交换的 P2P（`window_size` 个 token）是两次独立的串行通信。block range 划分使用 `cu_seqlens_ori_kv_global`（全局序列边界），而非 `cu_seqlens_ori_kv`（窗口张量边界）。
 
 #### 3.2.3 关键代码片段
 
@@ -1722,17 +1734,22 @@ MindSpeed 侧存在 `npu_lightning_indexer` wrapper，并有 TND cu_seq_lens 测
 ```mermaid
 flowchart TD
     A["模型 attention forward"] --> B["生成 q / ori_kv / hidden_states"]
-    B --> C{"compression_ratio > 1?"}
+    B --> W{"需要窗口交换?"}
+    W -- "类入口传 window_size" --> W1["DeepSeekV4CPContextParallel.forward<br/>自动窗口交换 + cu_seqlens 对齐"]
+    W -- "其他入口" --> W2["显式调用 exchange_deepseek_v4_previous_window"]
+    W1 --> C
+    W2 --> C
+    C{"compression_ratio > 1?"}
     C -- "No" --> H["构造 DeepSeekV4CPRuntimeInputs"]
     C -- "Yes" --> D["选择 compressed KV source"]
     D --> E["实现 compress_fn(candidate_blocks, context)"]
-    E --> F["prepare_deepseek_v4_compressed_kv_for_cp"]
+    E --> F["prepare_deepseek_v4_compressed_kv_for_cp<br/>(bridge 自动或显式调用)"]
     F --> G["prepared_compressed_kv"]
     G --> H
     H --> I{"C4A?"}
     I -- "Yes" --> J["提供 index_scores 或 sparse_count"]
     I -- "No" --> K["不传 index_scores"]
-    J --> L["run_deepseek_v4_cp_sparse_attention_from_runtime_inputs"]
+    J --> L["调用 bridge<br/>(类入口 / 函数入口 / config / runtime_inputs)"]
     K --> L
     L --> M["SparseFlashMla output"]
 ```
@@ -2587,7 +2604,7 @@ flowchart TD
 5. 单独整理 DS V4 CP 与 kvallgather_cp_algo 的性能和内存差异。
 ```
 
-✅ 已完成 6 轮自审修正（第 6 轮基于代码仓最新实现更新：9 文件拆分、R14 死锁修复、三种 bridge 入口、CANN 约束表、BSND 限制根因、两套 cu_seqlens 分离、两次 P2P 串行、`_send_recv` 并发通信、`_resolve_global_ranks` 映射、autograd 判断标准、类入口自动窗口交换、API Reference 入口扩展）
+✅ 已完成 7 轮自审修正（第 6-7 轮基于代码仓最新实现更新：9 文件拆分、R14 死锁修复、三种 bridge 入口、CANN 约束表、BSND 限制根因、两套 cu_seqlens 分离、两次 P2P 串行、`_send_recv` 并发通信、`_resolve_global_ranks` 映射、autograd 判断标准、类入口自动窗口交换、API Reference 入口扩展、架构图/顺序图/依赖图/流程图/接入路径图全面更新）
 
 <!-- archive-notes-summary-visual:start -->
 ## 总结图
