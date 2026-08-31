@@ -4,7 +4,7 @@
 
 ### Context Parallel
 
-- 2026-06-25 [第三章：MindSpeed DeepSeek V4 CP方案实现与接入](features/context_parallel/chapter-03-mindspeed-deepseek-v4-context-parallel.md) - 系统梳理 MindSpeed DeepSeek V4 CP 的 9 文件包拆分、生产者/消费者边界、类/函数/runtime bridge 入口、两阶段 P2P 与 compressed KV allgather、runtime metadata 契约、SMLA/CANN 硬约束、`compress_source` 解耦、BSND 限制根因、compress_fn 契约与第三方模型框架接入路径。
+- 2026-06-25 [第三章：MindSpeed DeepSeek V4 CP方案实现与接入](features/context_parallel/chapter-03-mindspeed-deepseek-v4-context-parallel.md) - 保留原 1-12 节架构并以 2026-08-29 新实现重梳理 G2 attention 到 LLM adapter、BSND/TND 双布局、可复用候选与异步 all-gather、C4A Indexer 右对齐/梯度路径、SMLA 对齐及 CANN 约束，同时列出迁移边界、测试缺口与风险。
   - Reason: 该笔记聚焦 MindSpeed 下 DeepSeek V4 Context Parallel 能力的实现架构和模型框架接入规范，和现有 Ulysses、Ring Attention CP 章节形成互补，适合作为 Context Parallel 专题第三章归档。
   - Visual: [summary image](summary_images/chapter-03-mindspeed-deepseek-v4-context-parallel.png)
 
