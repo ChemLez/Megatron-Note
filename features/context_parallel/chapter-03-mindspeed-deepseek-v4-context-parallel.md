@@ -177,7 +177,7 @@ sequenceDiagram
     CP->>CP: mask/pad + async all-gather + wait/compact
     CP->>CP: packed or ordinary original-window exchange
     CP->>SMLA: q + windowed ori_kv + prepared compressed KV
-    SMLA->>SMLA: prefix alignment; C4A visibility/remap/fallback
+    SMLA->>SMLA: prefix alignment, C4A visibility/remap/fallback
     SMLA->>CANN: DeepSeekV4CPSMLAInputs
     CANN-->>G2: attention output
 
