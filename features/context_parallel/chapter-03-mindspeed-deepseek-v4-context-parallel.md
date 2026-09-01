@@ -640,6 +640,238 @@ gathered_index      = source_rank * candidate_capacity + local_ordinal
 
 确定性选择计划按 `(sample_boundaries, cp_size, candidate_capacity, output_size, ratio, local_seq_len, device)` 作为 key，使用容量为 16 的 LRU（`_compressed_kv.py:910-1018`）。它缓存的是整数索引和 mask，不缓存模型激活；因此可降低重复 shape 的 host 计算，但不会减少 candidate compressor 或通信本身。
 
+#### 3.2.6.1 实例：TND Packed 多子序列 C4A（含 overlap）的 P2P → candidate → `compress_fn`
+
+下面用一个可以和当前测试对照的具体场景，展开“每个 rank 先通过 P2P 拿到前一 rank 的 hidden-state 尾部，再选本 rank 的 candidate，最后回调模型压缩器”的完整过程。这里的 `compress_source` 是 `hidden_states_for_cp_compress` 经过 adapter 布局转换后的 source，不是已经加过窗口的 `ori_kv`。
+
+**实例前提**
+
+| 项目 | 取值 | 代码语义 |
+|---|---|---|
+| 物理 batch | `batch_size=1` | TND 的物理 batch 固定为 1；Packed 仍可有多个逻辑 sample |
+| Packed sample | `cu_seqlens=[0,7,20,32]` | 3 个逻辑 sample，长度分别为 7、13、12 |
+| CP 拓扑 | `cp_size=2`，rank0/rank1 | 连续等长 shard，每个 rank 16 个 token |
+| rank 区间 | rank0=`[0,16)`；rank1=`[16,32)` | `local_seq_offset=cp_rank*16` |
+| C4A | `compression_ratio=R=4` | `Compressor.overlap=True`（`compressor.py:50-53`） |
+| original window | `window_size=128` | 本例中只用于 `ori_kv` 窗口流；C4A source tail 是 `2R=8` |
+| 布局和并行 | `TND`、`TP=1`、`SP=False` | `q=[16,N,D]`、`ori_kv=[16,1,D]`、`compress_source=[16,H]`，实际 `D=512` |
+
+把第 `i` 个 hidden-state token 记为 `h_i`，则全局 Packed 序列为：
+
+```text
+sample 0: [h0,  h1, ..., h6]                         -> global [0, 7)
+sample 1: [h7,  h8, ..., h19]                        -> global [7, 20)
+sample 2: [h20, h21, ..., h31]                       -> global [20, 32)
+
+rank 0 source: [h0, ..., h15]                         -> [0, 16)
+rank 1 source: [h16, ..., h31]                        -> [16, 32)
+```
+
+整体调用链如下；普通 C4A（无 Indexer）和 C4A+Indexer 只在 callback 数量及等待时机上不同。
+
+```mermaid
+flowchart LR
+    G2["csa.py:750-767\nhidden_states_for_cp_compress"] --> A["adapter TND\n_adapter.py:118-282"]
+    A --> P["exchange_deepseek_v4_previous_tails\n一次打包 P2P"]
+    P --> C["prepare_deepseek_v4_compression_candidates_for_cp\n每 rank 枚举 candidate"]
+    C --> F["compress_fn(candidate_blocks, context)\nC4A overlap"]
+    F --> AG["launch async all-gather\n_compressed_kv.py:487-522"]
+    AG --> W["wait + select/pad\n全局 block order"]
+    W --> S["compact cmp_kv\n交给 SMLA/Indexer"]
+```
+
+**步骤 1：Packed TND 的本地 metadata**
+
+`DeepSeek4SelfAttention.forward` 在 `csa.py:750-767` 保留 hidden states 作为 CP compressor source；adapter 的 `_model_tensor_to_deepseek_v4_cp_layout`（`deepseek_v4_cp_adapter.py:118-138`）把 `[S,1,H]` 展平成 `[T,H]`。`_build_sequence_metadata_for_deepseek_v4_cp`（同文件 `:141-282`）按全局 `cu_seqlens` 与 rank 区间求交集，因此本例 metadata 为：
+
+| rank | `local_seq_offset` | 本地 query 全局位置 | `cu_seqlens_q`（本地累计） | `sample_ids` 的非空区间 |
+|---:|---:|---|---|---|
+| 0 | 0 | `[0..15]` | `[0,7,16,16]` | sample0: `0..6`；sample1: `7..15` |
+| 1 | 16 | `[16..31]` | `[0,0,4,16]` | sample1: `16..19`；sample2: `20..31` |
+
+`cu_seqlens` 仍是全局 `[0,7,20,32]`，不能替换成本 rank 的 `cu_seqlens_q`。rank1 的第一个 `0` 表示 sample0 没有 query 落在本 rank，并不是要删除 sample0 这一项；保留零长度项才能让 Q/Ori/Cmp 的 Packed batch cardinality 一致（`build_deepseek_v4_cp_packed_seq_metadata`，`_smla_inputs.py:65-131`）。
+
+**步骤 2：一次 P2P 获取前一 rank 的 hidden-state 尾部**
+
+C4A overlap 需要当前 block 的 `R` 个 token和左邻 block 的 `R` 个 token，因此 core 将 source tail 长度设为 `2R=8`。C4A+Indexer adapter 的实际调用位于 `deepseek_v4_cp_adapter.py:1600-1606`；普通 C4A 则由类入口 `deepseek_v4_context_parallel.py:163-190` 完成同样的调用：
+
+```python
+# deepseek_v4_cp_adapter.py:1600-1606（C4A + Indexer 路径）
+previous_ori_kv, previous_compress_source = exchange_deepseek_v4_previous_tails(
+    local_tensors=(runtime.ori_kv, compress_source_bridge),
+    tail_lengths=(runtime.window_size, effective_ratio * 2),
+    cp_group=runtime.cp_group,
+    cp_global_ranks=runtime.cp_global_ranks,
+    seq_dim=runtime.sequence_dim,
+)
+```
+
+普通 C4A 的类入口随后把同一份 `previous_compress_source` 传给一步式 prepare；`prepare_deepseek_v4_compressed_kv_for_cp` 内部再调用 `compress_fn` 并 launch/wait all-gather：
+
+```python
+# deepseek_v4_context_parallel.py:163-190（普通 C4A）
+previous_ori_kv, previous_compress_source = exchange_deepseek_v4_previous_tails(
+    local_tensors=(ori_kv, compress_source),
+    tail_lengths=(window_size, previous_context_len),
+    cp_group=cp_group,
+    cp_global_ranks=cp_global_ranks,
+    seq_dim=seq_dim,
+)
+prepared_compressed_kv = prepare_deepseek_v4_compressed_kv_for_cp(
+    compress_source, self.compression_ratio, compress_fn,
+    cp_group=cp_group, seq_dim=seq_dim,
+    cu_seqlens=cu_seqlens, local_seq_offset=local_seq_offset,
+    include_left_context=include_left_context,
+    previous_tail=previous_compress_source,
+)
+```
+
+`exchange_deepseek_v4_previous_tails`（`_distributed.py:586-618`）把 `ori_kv` tail 和 source tail 展平后交给 `_ReceivePreviousTails.forward`（`:74-115`）一次发送/接收；并不是把完整历史 hidden states 广播给所有 rank。
+
+| rank | forward 发送的 source tail | forward 收到的 `previous_compress_source` | 说明 |
+|---:|---|---|---|
+| 0 | `h[8:16]` 发给 rank1 | 形状 `[8,H]` 的零张量 | 没有前驱；rank0 的 sample 起点不会使用这段零 tail |
+| 1 | `h[24:32]`（无后继接收者） | `h[8:16]` | 用于补齐跨 rank candidate 和其左邻 block |
+
+本例 rank1 的 source 扩展视图是 `cat(h[8:16], h[16:32])`，全局覆盖 `[8,32)`；`previous_context_len=8`，所以 `extended_start=16-8=8`。收到的 source tail 会作为 `previous_tail` 传给 candidate prepare（`deepseek_v4_cp_adapter.py:1643-1655` 或 `deepseek_v4_context_parallel.py:178-190`），candidate builder 看到已提供 tail 后不会再次发起 source P2P。`previous_ori_kv` 是另一条数据流，供后续 sample-aware original-window 构造，不能拿来替代 hidden-state source。
+
+**步骤 3：按 block end 归属为每个 rank 选择 candidate**
+
+`_enumerate_global_candidate_starts`（`_compressed_kv.py:1098-1120`）先在每个 sample 内以 `R=4` 只保留完整 block：
+
+| sample | 完整 block 起点 | 完整 block 数 | residual |
+|---|---|---:|---:|
+| 0 `[0,7)` | `0`，即 `[0,4)` | 1 | 3 |
+| 1 `[7,20)` | `7`、`11`、`15` | 3 | 1 |
+| 2 `[20,32)` | `20`、`24`、`28` | 3 | 0 |
+
+全局 block 顺序为 `[0,7,11,15,20,24,28]`。本实现按 **block end** 归属 rank（候选枚举 `_compressed_kv.py:800-864`，owner 映射 `_compressed_kv.py:1041-1069`）：
+
+```text
+owner(block_start) = rank i  iff
+    local_start_i < block_start + R <= local_end_i
+```
+
+因此 rank0 只负责 `[0,4)`、`[7,11)`、`[11,15)`；rank1 负责 `[15,19)`、`[20,24)`、`[24,28)`、`[28,32)`。`[15,19)` 从 rank0 的尾部开始、在 rank1 结束，rank1 用 P2P 收到的 `h15` 补成完整 block，而不是由两个 rank 各压一半。
+
+每个 rank 的 `candidate_capacity=16//4+1=5`。由于本例 `cu_seqlens` 有多个 sample，`_can_use_compact_candidate_view`（`_compressed_kv.py:336-391`）会关闭单段 compact view；callback 实际收到固定容量 `[5,4,H]`，而不是只含有效行的动态 tensor。
+
+```text
+rank 0
+  extended_start = -8
+  extended source = [zero x 8 | h0 ... h15]
+  candidate_starts = [0, 7, 11, -1, -1]
+  valid_mask       = [T,  T,  T,  F,  F]
+  candidate_blocks[0:3] =
+      [[h0,  h1,  h2,  h3 ],
+       [h7,  h8,  h9,  h10],
+       [h11, h12, h13, h14]]
+  candidate_sample_positions = [0, 0, 4, 0, 0]
+  sample_ids                 = [0, 1, 1, -1, -1]
+
+rank 1
+  extended_start = 8
+  extended source = [h8 ... h15 | h16 ... h31]
+  candidate_starts = [15, 20, 24, 28, -1]
+  valid_mask       = [T,  T,  T,  T,  F]
+  candidate_blocks[0:4] =
+      [[h15, h16, h17, h18],
+       [h20, h21, h22, h23],
+       [h24, h25, h26, h27],
+       [h28, h29, h30, h31]]
+  candidate_sample_positions = [8, 0, 4, 8, 0]
+  sample_ids                 = [1, 2, 2, 2, -1]
+```
+
+`_gather_padded_blocks`（`_compressed_kv.py:889-913`）根据 `candidate_offsets` 做一次批量 gather；无效行使用安全 offset 并由 `valid_mask` 乘零。rank1 第 0 行的 offset 是 `15-8=7`，所以准确取到 `h15`（previous tail 的最后一个 token）和本地 `h16..h18`。
+
+overlap 所需左邻 block 的 metadata 也按 sample boundary 计算，不能简单使用 `candidate_start-R` 后跨 sample 借 token：
+
+| rank | `left_context_starts` | `left_context_valid_mask` | `left_context_source_indices` | 跨 rank boundary |
+|---:|---|---|---|---|
+| 0 | `[-1,-1,7,-1,-1]` | `[F,F,T,F,F]` | `[-1,-1,1,-1,-1]` | 无 |
+| 1 | `[11,-1,20,24,-1]` | `[T,F,T,T,F]` | `[-1,-1,1,2,-1]` | row0，`left_context_boundary_indices=[0]` |
+
+具体含义：rank0 的 start=`7` 是 sample1 的首 block，其左邻 start=`3` 位于 sample0，故 row1 左上下文无效；rank1 的 start=`20` 是 sample2 的首 block，其左邻 start=`16` 位于 sample1，故 row1 左上下文同样无效。rank1 row0 的左邻 start=`11` 不在本 rank candidate 列表中，但在收到的 `h[8:16]` 内，实际 block 为 `[h11,h12,h13,h14]`。本例的可复用 segment 为 rank0 `((2,3,1),)`、rank1 `((2,4,1),)`；非 compact Packed core context 以完整 `left_context_blocks` 提供这些行，Indexer 的 shared-input 优化再从中派生 boundary-only `left_context_boundary_blocks`。
+
+**步骤 4：C4A overlap callback 如何消费 candidate**
+
+core 的 `_call_deepseek_v4_compress_fn`（`_utils.py:51-53`）只做两参数调用；candidate prepare 本身不调用模型压缩器，真正的调用发生在 `launch_deepseek_v4_compress_candidates_for_cp`（`_compressed_kv.py:487-522`）：
+
+```python
+# _compressed_kv.py:495-508
+candidate_blocks = prepared_candidates.candidate_blocks
+compress_context = prepared_candidates.compress_context
+local_compressed = _call_deepseek_v4_compress_fn(
+    compress_fn, candidate_blocks, compress_context
+)
+local_compressed = _mask_and_pad_local_compressed(
+    local_compressed, candidate_blocks, compress_context
+)
+```
+
+G2 使用的 `DeepSeekV4CPCompressorCallback`（`deepseek_v4_cp_adapter.py:647-710`）在本例中的 shape 流程是：
+
+```text
+candidate_blocks                         [5, 4, H]
+  -> project_candidate_blocks             projected KV/score [5, 4, 2D]
+  -> _build_overlap_inputs                overlap KV/score  [5, 8, D]
+  -> compress_candidate_blocks(reduce dim=1)
+                                           [5, D]
+  -> norm + TND RoPE + singleton KV head  [5, 1, D]
+```
+
+`Compressor` 的 `wkv/wgate` 每个 token 投影出 `2D`（`compressor.py:55-64`）。`_build_overlap_inputs`（`deepseek_v4_cp_adapter.py:757-830`）把当前 candidate 的第二个 `D` 半区放入 overlap tensor 的后 `R` 个位置，把左邻 block 的第一个 `D` 半区放入前 `R` 个位置；对应 rank1 row0：
+
+```text
+left_context_blocks[0] = [h11,h12,h13,h14]
+  -> left projection 的前 D 维 -> overlap[:, 0:4, :]
+
+candidate_blocks[0] = [h15,h16,h17,h18]
+  -> current projection 的后 D 维 -> overlap[:, 4:8, :]
+
+softmax(score, dim=1) over 8 positions -> one compressed KV [1,D]
+```
+
+row1（candidate start=`20`）是 sample2 的首 block，`left_context_valid_mask=False`，因此 overlap 前四个位置保持 zero/`-inf` score；不会把 sample1 的 `h16..h19` 拼进 sample2。rank1 row2/row3 的左邻分别是本地 candidate row1/row2，可在 Indexer adapter 的非 FP8 shared-input 路径复用已计算的 projection（`deepseek_v4_cp_adapter.py:832-915`）；普通无 Indexer callback 则直接对 `left_context_blocks` 重新 projection。
+
+Packed callback 的 RoPE 位置使用 sample-local 坐标。因为 adapter 构造 callback 时传入 `cu_seqlens=runtime.global_cu_seqlens`（`deepseek_v4_cp_adapter.py:493-497`），`_resolve_candidate_positions`（`:712-755`）选择 `candidate_sample_positions`：rank0 为 `[0,0,4,0,0]`，rank1 为 `[8,0,4,8,0]`，而不是把 rank1 的第一行错误地当成 global position 15。无效 row 仍使用安全位置 0，并由 `valid_mask` 在 callback 前后清零；callback 必须保持第 0 维为 5，不能删除 padding row 或让有状态 compressor 更新无效行。
+
+**步骤 5：all-gather 后的全局顺序，以及 C4A+Indexer 的额外 callback**
+
+两个 rank 的 callback 都返回 `[5,1,D]`，无效 row 为零。`_AllGatherCompressedKVAsync`（`_distributed.py:243-279`）得到 rank-major `[10,1,D]`；确定性 selection plan 将全局 block 起点映射为：
+
+```text
+global block_starts = [0, 7, 11, 15, 20, 24, 28, -1]
+source_rank         = [0, 0,  0,  1,  1,  1,  1,  -1]
+selected_indices    = [0, 1,  2,  5,  6,  7,  8]
+valid_count         = 7
+```
+
+这里 `candidate_capacity=5`，所以 rank1 的第一个有效 candidate 在 rank-major gathered tensor 中的索引是 `1*5+0=5`。`wait_deepseek_v4_compressed_kv`（`_compressed_kv.py:525-545`）先按 `selected_indices` 重排并补到 `output_size=32//4=8`，再由 `compact_deepseek_v4_compressed_kv`（`:548-569`）去掉最后一个 padding，得到 `[7,1,D]` 和 block starts `[0,7,11,15,20,24,28]`。三个 sample 的 `cmp_residual_kv` 是 `[3,1,0]`，不会跨 sample 借 token。
+
+若 G2 进入 `run_deepseek_v4_cp_attention_with_indexer`（`deepseek_v4_cp_adapter.py:1547-1921`），上面的 candidate plan 只构造一次（`:1642-1655`），随后有两次 callback launch：
+
+```text
+main `compress_fn`：DeepSeekV4CPCompressorCallback(attention.compressor, ...)
+  -> launch（`:1663-1673`），保留主 attention 的梯度
+
+indexer `compress_fn`：DeepSeekV4CPCompressorCallback(indexer.kv_compressor, ...)
+  -> detached candidates + launch（`:1677-1688`），默认不把 source 梯度回传到主分支
+```
+
+两条 callback 都消费同一 rank-local candidate/block order；主 KV 和 Indexer key 的 all-gather 可以分别异步 launch，Indexer 先 wait/compact key，再做 top-k，主分支随后 wait/compact。无 Indexer 的普通 C4A 则只执行一次主 callback，但 P2P、candidate ownership、overlap 左上下文和 global compact order 完全相同。
+
+**本例可复核的不变量**
+
+1. P2P 只交换前一 rank 的尾部：C4A source 为 `2R=8` 个 hidden-state token，`ori_kv` 的 `window_size=128` 是独立窗口数据流。
+2. 每个完整 block 只有一个 owner；跨 rank 的 `[15,19)` 由 rank1 用 `h15` 补齐后整体压缩。
+3. `cu_seqlens` 约束 block 和 left-context 不跨 Packed sample；sample 首 block 的左上下文必须无效。
+4. Packed 多子序列关闭 compact candidate view，callback 看到固定 `[candidate_capacity,R,H]`，并通过 `valid_mask` 处理 padding。
+5. callback 输出的 candidate 维、压缩 ratio、sample-local position 和左上下文 metadata 必须保持一致，之后才能安全 all-gather/compact。
+
+该数值场景与 MindSpeed-LLM `test_deepseek_v4_cp_integration.py:3529-3574`（Packed rank metadata）、`:3622-3748`（C4A+Indexer）及 `:3751-3780`（无 Indexer C4A）使用的 `[0,7,20,32]`、`CP=2` 契约一致；candidate 公式和 sample boundary 断言见 MindSpeed `test_candidate_plan_vectorization.py:14-153`。
+
 #### 3.2.7 异常与边界处理
 
 | 边界/异常 | 检查位置 | 当前处理 |
