@@ -1,0 +1,22 @@
+sequenceDiagram
+    autonumber
+    participant T as 训练入口/配置
+    participant F as FSDPTurbo
+    participant P as CP Patch
+    participant K as KDA 实例
+    T->>T: 加载 YAML<br/>校验并行度与互斥条件
+    Note over T,F: Ulysses 和 KCP 不能同时大于 1
+    T->>F: FSDPTurbo(config, model)
+    F->>F: init_parallel_state(config)<br/>建立 CP 组
+    F->>F: apply_cp_modules()
+    alt ulysses_parallel_size 大于 1
+        F->>P: Ulysses patch 列表与 Ulysses group
+        P->>P: get_ulysses_kda_forward<br/>(original, group)
+        P->>K: 绑定返回的 forward
+    else kcp_parallel_size 大于 1
+        F->>P: KCP patch 列表与 KCP group
+        P->>P: get_fla_state_kda_forward<br/>(original, group)
+        P->>K: 绑定返回的 forward
+    end
+    F->>F: 安装 CP loss<br/>与图文融合后切分入口
+    Note over F,K: 每批数据直接调用已绑定的实现

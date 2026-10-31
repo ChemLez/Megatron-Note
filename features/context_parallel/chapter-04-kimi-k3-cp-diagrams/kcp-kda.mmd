@@ -1,0 +1,9 @@
+flowchart LR
+    A["本地序列、全部 heads"] --> B["投影与 beta sigmoid"]
+    B --> C["构建 CP context"]
+    C --> D["卷积边界 token 通信"]
+    D --> E["本地因果卷积"]
+    E --> F["状态变换摘要 All-Gather"]
+    F --> G["按 rank 顺序合并前序状态"]
+    G --> H["本地 chunk KDA"]
+    H --> I["输出 gate、norm、projection"]

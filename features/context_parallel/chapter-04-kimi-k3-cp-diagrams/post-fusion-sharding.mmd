@@ -1,0 +1,7 @@
+flowchart LR
+    A["完整文本 embedding 与图像特征"] --> B["图文融合"]
+    B --> C["保留完整 labels"]
+    B --> D["embedding、position、mask 右侧补齐"]
+    D --> E["按 CP 组内 rank 连续取片"]
+    E --> F["语言模型与 KDA"]
+    C --> G["CP loss 中全局 shift 后切分"]

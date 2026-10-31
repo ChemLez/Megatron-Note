@@ -1,0 +1,9 @@
+flowchart LR
+    A["本地序列、全部 heads"] --> B["本地投影"]
+    B --> C["All-to-All：channel 换 sequence"]
+    C --> D["完整序列、部分 head channels"]
+    D --> E["按 head 切片的因果卷积"]
+    E --> F["chunk KDA"]
+    F --> G["逆向 All-to-All"]
+    G --> H["本地序列、全部 heads"]
+    H --> I["输出 gate、norm、projection"]

@@ -1,0 +1,18 @@
+Generation mode: built-in image_gen (imagegen skill)
+Archive date: 2026-10-31 (Asia/Shanghai)
+Purpose: educational summary for Kimi K3 KDA / MLA Context Parallel note.
+
+Use case: infographic-diagram.
+Asset type: project-bound PNG summary for a Chinese engineering note.
+Create a polished educational technical infographic on a light ivory background, wide landscape, generous whitespace, crisp readable typography, restrained navy/teal/orange. No decoration-only art, no watermarks. The graphic must accurately summarize THIS implementation, with no invented algorithms, benchmarks or support claims.
+Exact main title: "Kimi K3：KDA 上下文并行"
+Subtitle: "初始化选算法 → 图文融合后连续切分 → 执行已绑定的 forward"
+Use a clear three-stage reading flow:
+1. Top compact strip titled "01 初始化". Two mutually exclusive settings: "Ulysses: U > 1, K = 1" and "KCP: K > 1, U = 1". Text: "Bind KDA forward + CP group".
+2. Full-width strip titled "02 数据切分". Pipeline "Multimodal fusion" → "Right padding" → "Contiguous shards". Show 16 tokens as four adjacent equal blocks labeled "rank 0: 0–3", "rank 1: 4–7", "rank 2: 8–11", "rank 3: 12–15". Exact note "顺序连续切分；无 Zigzag". Both algorithms use the SAME partition.
+3. Bottom two equal columns titled "03A Ulysses" (teal) and "03B KCP" (orange). Ulysses column shows a simple vertical path: "Local sequence / all heads" → "All-to-All: Q K V decay beta" → "Full sequence / partial heads" → "Sliced causal conv + chunk KDA" → "Inverse All-to-All" → "Local sequence / all heads". KCP column: "Local sequence / all heads" → "CP causal conv: boundary tokens" → "State summaries: All-Gather" → "Ordered prefix-state merge" → "Local chunk KDA" → "Local sequence / all heads".
+Footer outside the columns with three concise readable statements:
+"MLA：两种模式均复用同组 Ulysses"
+"KCP：B=1 · TP=1 · KV-AllGather=1 · key dim ≤ 256"
+"当前 MLA CP patch 需 eager"
+Constraints: depict sequence repartition only for Ulysses; KCP must never gather full Q/K/V sequence and must never be drawn as a point-to-point ring. Algorithm selection happens BEFORE batch partition. This is a conceptual summary, not a performance chart. Exact technical symbols All-to-All, All-Gather, KDA, MLA, KCP, Ulysses must be spelled correctly. Keep every label readable, avoid dense paragraphs.

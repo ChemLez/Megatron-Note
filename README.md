@@ -4,6 +4,10 @@
 
 ### Context Parallel
 
+- 2026-10-31 [第四章：Kimi K3 KDA与MLA上下文并行配置及实现顺序图](features/context_parallel/chapter-04-kimi-k3-kda-mla-context-parallel.md) - 归档 Kimi K3 的 KDA/MLA CP 支持矩阵、Ulysses 与 KCP 使能约束、融合后连续切分、初始化与前向顺序图，以及已确认的后端和 mask 风险。
+  - Reason: 内容聚焦 Kimi K3 上下文并行的配置与源码实现，与现有 Context Parallel 专题直接匹配，作为第四章补充 KDA 状态并行与 MLA 配合机制。
+  - Visual: [summary image](features/context_parallel/summary-visual.png)
+
 - 2026-06-25 [第三章：MindSpeed DeepSeek V4 CP方案实现与接入](features/context_parallel/chapter-03-mindspeed-deepseek-v4-context-parallel.md) - 保留原 1-12 节架构并以 2026-08-29 新实现重梳理 G2 attention 到 LLM adapter、BSND/TND 双布局、可复用候选与异步 all-gather、C4A Indexer 右对齐/梯度路径、SMLA 对齐及 CANN 约束，同时列出迁移边界、测试缺口与风险。
   - Reason: 该笔记聚焦 MindSpeed 下 DeepSeek V4 Context Parallel 能力的实现架构和模型框架接入规范，和现有 Ulysses、Ring Attention CP 章节形成互补，适合作为 Context Parallel 专题第三章归档。
   - Visual: [summary image](summary_images/chapter-03-mindspeed-deepseek-v4-context-parallel.png)

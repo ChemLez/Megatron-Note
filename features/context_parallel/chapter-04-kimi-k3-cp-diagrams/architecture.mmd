@@ -1,0 +1,13 @@
+flowchart TD
+    A["train.py 加载配置、构建本地 K3"] --> B["FSDPTurbo 初始化通信组"]
+    B --> C{"初始化选择 CP 算法"}
+    C -->|"Ulysses > 1"| D["绑定 Ulysses KDA forward"]
+    C -->|"KCP > 1"| E["绑定状态 CP KDA forward"]
+    D --> F["安装融合后切分入口与 CP loss"]
+    E --> F
+    F --> G["每批输入：完整文本与图像特征融合"]
+    G --> H["右侧补齐、按 CP 组内 rank 连续切分"]
+    H --> I["语言模型调用已绑定的 KDA forward"]
+    I --> J["KDA 返回本地序列输出"]
+    J --> K["后续 Decoder 层与本地 logits"]
+    K --> L["完整 labels 全局 shift、切分、CP loss"]

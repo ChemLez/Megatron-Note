@@ -1,0 +1,50 @@
+sequenceDiagram
+    autonumber
+    participant M as K3 模型入口
+    participant S as 序列切分
+    participant L as 语言模型/Decoder
+    participant K as 已绑定的 KDA forward
+    participant C as CP 组通信
+    participant O as 卷积/KDA 算子
+    M->>M: 文本 embedding<br/>图像特征提取与融合
+    M->>M: 准备完整 position、mask<br/>保留完整 labels
+    M->>S: shard_fused_sequence_inputs<br/>(..., cp_group)
+    S->>S: 右侧补齐至 Sp
+    S->>S: 取连续区间 [r*L, (r+1)*L)
+    Note over M,S: 两种模式共用顺序切分，无 Zigzag
+    S-->>M: 本地 embedding [B,L,Dmodel]<br/>本地 position、mask
+    M->>L: language_model(inputs_embeds=本地片段)
+    L->>L: 进入 KDA Decoder 层<br/>执行输入归一化
+    L->>K: self_attn(hidden_states,<br/>attention_mask, ...)
+    alt 初始化时绑定为 Ulysses
+        K->>K: 检查 cache、packed 输入<br/>及 H 对 P 的整除关系
+        K->>K: 应用本地 mask<br/>投影 Q/K/V/decay/beta
+        K->>C: 五组投影分别执行 All-to-All
+        C-->>K: 完整顺序序列<br/>部分 head channels
+        K->>O: Q/K/V 使用对应 head 的卷积权重切片
+        O-->>K: 完整序列的卷积输出
+        K->>K: reshape 为 [B,Sp,H/P,d]<br/>切取状态参数
+        K->>O: chunk_kda，走模型注册算子入口
+        O-->>K: [B,Sp,H/P,d]
+        K->>C: 逆向 All-to-All
+        C-->>K: 本地序列、全部 heads<br/>恢复为 [B,L,H,d]
+    else 初始化时绑定为 KCP
+        K->>K: 检查 B=1、三维输入<br/>卷积窗口等条件
+        K->>K: 应用本地 mask<br/>投影 Q/K/V/decay<br/>beta sigmoid
+        K->>O: build_kcp_context([0,Sp], group, kernel_size)
+        O-->>K: 本 rank 的区间<br/>与前后依赖 context
+        K->>O: Q/K/V 分别执行 CP 因果卷积
+        O->>C: 交换卷积尾部 token
+        C-->>O: 前序片段的因果边界数据
+        O-->>K: 本地卷积输出
+        K->>K: reshape 为 [1,L,H,d]<br/>保留全部 heads
+        K->>O: kcp_chunk_kda(..., cp_context=context)
+        O->>O: 计算本地状态变换摘要
+        O->>C: All-Gather 状态摘要
+        C-->>O: 各 rank 的摘要
+        O->>O: 按 rank 顺序合并前序摘要<br/>完成本地 KDA
+        O-->>K: [1,L,H,d]
+    end
+    K->>K: 输出 gate、o_norm、o_proj<br/>输出 padding mask
+    K-->>L: 本地序列输出 [B,L,Dmodel]
+    Note over L: 继续残差、MLP/MoE 及后续层
